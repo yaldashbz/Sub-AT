@@ -3,6 +3,7 @@ import os
 import shutil
 import time
 import sys
+import collections
 
 import torch
 import torch.nn as nn
