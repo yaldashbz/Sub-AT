@@ -1,66 +1,56 @@
-import argparse
+import collections.abc as container_abcs
 import os
-import shutil
-import time
+import random
 import sys
-import collections
 
+import numpy as np
 import torch
 import torch.nn as nn
+# import torch.autograd.gradcheck as tgc
+import torch.nn.functional as F
 import torch.nn.parallel
-import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data
-# from torch.autograd.gradcheck import zero_gradients
-import torch.nn.functional as F
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+from advertorch.attacks import LinfPGDAttack, L2PGDAttack
+from advertorch.utils import NormalizeByChannelMeanStd
+from torch.autograd import Variable
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CIFAR10, CIFAR100, ImageFolder
-from torch.autograd import Variable
-import torch.autograd as autograd
 
-
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
-import numpy as np
-from numpy import linalg as LA
-import pickle
-import random
-
-from advertorch.attacks import LinfPGDAttack, L2PGDAttack
-from advertorch.context import ctx_noparamgrad
-from advertorch.utils import NormalizeByChannelMeanStd
 
 def zero_gradients(x):
     if isinstance(x, torch.Tensor):
         if x.grad is not None:
             x.grad.detach_()
             x.grad.zero_()
-    elif isinstance(x, collections.abc.Iterable):
+    elif isinstance(x, container_abcs.Iterable):
         for elem in x:
             zero_gradients(elem)
+
 
 def get_model_param_vec(model):
     """Return model parameters as a vector"""
     vec = []
-    for name,param in model.named_parameters():
+    for name, param in model.named_parameters():
         vec.append(param.detach().cpu().numpy().reshape(-1))
     return np.concatenate(vec, 0)
 
+
 class Logger(object):
-    def __init__(self,fileN ="Default.log"):
+    def __init__(self, fileN="Default.log"):
         self.terminal = sys.stdout
-        self.log = open(fileN,"a")
- 
-    def write(self,message):
+        self.log = open(fileN, "a")
+
+    def write(self, message):
         self.terminal.write(message)
         self.log.write(message)
- 
+
     def flush(self):
         pass
 
-def set_seed(seed=1): 
+
+def set_seed(seed=1):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -68,20 +58,23 @@ def set_seed(seed=1):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def print_args(args):
-    print ('batch size:', args.batch_size)
-    print ('Attack Norm:', args.norm)
-    print ('train eps: {} train step: {} train gamma: {} train randinit: {}'.format(args.train_eps, args.train_step, args.train_gamma, args.train_randinit))
-    print ('test eps: {} test step: {} test gamma: {} test randinit: {}'.format(args.test_eps, args.test_step, args.test_gamma, args.test_randinit))
-    print ('Model:', args.arch)
-    print ('Dataset:', args.datasets)
 
+def print_args(args):
+    print('batch size:', args.batch_size)
+    print('Attack Norm:', args.norm)
+    print('train eps: {} train step: {} train gamma: {} train randinit: {}'.format(args.train_eps, args.train_step,
+                                                                                   args.train_gamma,
+                                                                                   args.train_randinit))
+    print('test eps: {} test step: {} test gamma: {} test randinit: {}'.format(args.test_eps, args.test_step,
+                                                                               args.test_gamma, args.test_randinit))
+    print('Model:', args.arch)
+    print('Dataset:', args.datasets)
 
 
 ################################ PGD attack #######################################
 def epoch_adversarial(loader, model, args, opt=None, **kwargs):
     """Adversarial training/evaluation epoch over the dataset"""
-    total_loss, total_err = 0.,0.
+    total_loss, total_err = 0., 0.
 
     if args.norm == 'linf':
         adversary = LinfPGDAttack(
@@ -92,29 +85,31 @@ def epoch_adversarial(loader, model, args, opt=None, **kwargs):
         adversary = L2PGDAttack(
             model, loss_fn=nn.CrossEntropyLoss(), eps=args.test_eps, nb_iter=args.test_step, eps_iter=args.test_gamma,
             rand_init=args.test_randinit, clip_min=0.0, clip_max=1.0, targeted=False
-        )  
+        )
 
     model.eval()
-    for X,y in loader:
-        X,y = X.cuda(), y.cuda()
+    for X, y in loader:
+        X, y = X.cuda(), y.cuda()
         # delta = attack(model, X, y, **kwargs)
-        #adv samples
+        # adv samples
         input_adv = adversary.perturb(X, y)
         yp = model(input_adv)
-        loss = nn.CrossEntropyLoss()(yp,y)
-        
+        loss = nn.CrossEntropyLoss()(yp, y)
+
         total_err += (yp.max(dim=1)[1] != y).sum().item()
         total_loss += loss.item() * X.shape[0]
-        
+
     return 1 - total_err / len(loader.dataset), total_loss / len(loader.dataset)
+
 
 def clamp(X, lower_limit, upper_limit):
     return torch.max(torch.min(X, upper_limit), lower_limit)
 
-def attack_pgd(model, X, y, epsilon=8./255, alpha=2./255, attack_iters=50, restarts=10,
+
+def attack_pgd(model, X, y, epsilon=8. / 255, alpha=2. / 255, attack_iters=50, restarts=10,
                norm='l_inf', early_stop=False,
                mixup=False, y_a=None, y_b=None, lam=None):
-    upper_limit, lower_limit = 1,0
+    upper_limit, lower_limit = 1, 0
     max_loss = torch.zeros(y.shape[0]).cuda()
     max_delta = torch.zeros_like(X).cuda()
     for _ in range(restarts):
@@ -122,17 +117,17 @@ def attack_pgd(model, X, y, epsilon=8./255, alpha=2./255, attack_iters=50, resta
         if norm == "l_inf":
             delta.uniform_(-epsilon, epsilon)
         elif norm == "l_2":
-            delta.uniform_(-0.5,0.5).renorm(p=2, dim=1, maxnorm=epsilon)
+            delta.uniform_(-0.5, 0.5).renorm(p=2, dim=1, maxnorm=epsilon)
         else:
             raise ValueError
-        delta = clamp(delta, lower_limit-X, upper_limit-X)
+        delta = clamp(delta, lower_limit - X, upper_limit - X)
         delta.requires_grad = True
         for _ in range(attack_iters):
             output = model(X + delta)
             if early_stop:
                 index = torch.where(output.max(1)[1] == y)[0]
             else:
-                index = slice(None,None,None)
+                index = slice(None, None, None)
             if not isinstance(index, slice) and len(index) == 0:
                 break
             loss = F.cross_entropy(output, y)
@@ -144,39 +139,40 @@ def attack_pgd(model, X, y, epsilon=8./255, alpha=2./255, attack_iters=50, resta
             if norm == "l_inf":
                 d = torch.clamp(d + alpha * torch.sign(g), min=-epsilon, max=epsilon)
             elif norm == "l_2":
-                g_norm = torch.norm(g.view(g.shape[0],-1),dim=1).view(-1,1,1,1)
-                scaled_g = g/(g_norm + 1e-10)
-                d = (d + scaled_g*alpha).view(d.size(0),-1).renorm(p=2,dim=0,maxnorm=epsilon).view_as(d)
+                g_norm = torch.norm(g.view(g.shape[0], -1), dim=1).view(-1, 1, 1, 1)
+                scaled_g = g / (g_norm + 1e-10)
+                d = (d + scaled_g * alpha).view(d.size(0), -1).renorm(p=2, dim=0, maxnorm=epsilon).view_as(d)
             d = clamp(d, lower_limit - x, upper_limit - x)
             delta.data[index, :, :, :] = d
             delta.grad.zero_()
 
-        all_loss = F.cross_entropy(model(X+delta), y, reduction='none')
+        all_loss = F.cross_entropy(model(X + delta), y, reduction='none')
         max_delta[all_loss >= max_loss] = delta.detach()[all_loss >= max_loss]
         max_loss = torch.max(max_loss, all_loss)
     return max_delta
+
 
 def epoch_adversarial_PGD50(test_loader, model, epsilon=8):
     model.eval()
 
     total_err, total_loss = 0, 0
-    for X,y in test_loader:
-        X,y = X.cuda(), y.cuda()
-        #adv samples
-        delta = attack_pgd(model, X, y, epsilon=epsilon/255)
+    for X, y in test_loader:
+        X, y = X.cuda(), y.cuda()
+        # adv samples
+        delta = attack_pgd(model, X, y, epsilon=epsilon / 255)
         yp = model(X + delta)
-        loss = nn.CrossEntropyLoss()(yp,y)
-        
+        loss = nn.CrossEntropyLoss()(yp, y)
+
         total_err += (yp.max(dim=1)[1] != y).sum().item()
         total_loss += loss.item() * X.shape[0]
-        
-    print ('PGD50: ', 1 - total_err / len(test_loader.dataset))
+
+    print('PGD50: ', 1 - total_err / len(test_loader.dataset))
 
     return 1 - total_err / len(test_loader.dataset)
 
+
 ################################ datasets #######################################
 def cifar10_dataloaders(batch_size=128, num_workers=2, data_dir='datasets/cifar10'):
-
     train_transform = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -197,8 +193,8 @@ def cifar10_dataloaders(batch_size=128, num_workers=2, data_dir='datasets/cifar1
 
     return train_loader, val_loader, test_loader
 
-def cifar100_dataloaders(batch_size=128, num_workers=2, data_dir='datasets/cifar100'):
 
+def cifar100_dataloaders(batch_size=128, num_workers=2, data_dir='datasets/cifar100'):
     train_transform = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -220,8 +216,9 @@ def cifar100_dataloaders(batch_size=128, num_workers=2, data_dir='datasets/cifar
 
     return train_loader, val_loader, test_loader
 
-def tiny_imagenet_dataloaders(batch_size=128, num_workers=2, data_dir = 'datasets/tiny-imagenet-200', permutation_seed=10):
 
+def tiny_imagenet_dataloaders(batch_size=128, num_workers=2, data_dir='datasets/tiny-imagenet-200',
+                              permutation_seed=10):
     train_transform = transforms.Compose([
         transforms.RandomCrop(64, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -248,6 +245,7 @@ def tiny_imagenet_dataloaders(batch_size=128, num_workers=2, data_dir = 'dataset
 
     return train_loader, val_loader, test_loader
 
+
 def get_datasets(args):
     if args.datasets == 'CIFAR10':
         return cifar10_dataloaders(batch_size=args.batch_size, num_workers=args.workers)
@@ -256,7 +254,9 @@ def get_datasets(args):
         return cifar100_dataloaders(batch_size=args.batch_size, num_workers=args.workers)
 
     elif args.datasets == 'TinyImagenet':
-        return tiny_imagenet_dataloaders(batch_size=args.batch_size, num_workers=args.workers, permutation_seed=args.randomseed)
+        return tiny_imagenet_dataloaders(batch_size=args.batch_size, num_workers=args.workers,
+                                         permutation_seed=args.randomseed)
+
 
 def get_model(args):
     if args.datasets == 'CIFAR10':
@@ -268,12 +268,12 @@ def get_model(args):
         num_class = 100
         dataset_normalization = NormalizeByChannelMeanStd(
             mean=[0.5071, 0.4865, 0.4409], std=[0.2673, 0.2564, 0.2762])
-    
+
     elif args.datasets == 'TinyImagenet':
         num_class = 200
         dataset_normalization = NormalizeByChannelMeanStd(
             mean=[0.4802, 0.4481, 0.3975], std=[0.2302, 0.2265, 0.2262])
-    
+
     if args.arch == 'PreActResNet18':
         import resnet
         net = resnet.__dict__[args.arch](num_classes=num_class)
@@ -283,8 +283,9 @@ def get_model(args):
         net = wideresnet.__dict__[args.arch](28, num_classes=num_class, widen_factor=10, dropRate=0.0)
 
     net.normalize = dataset_normalization
-    
+
     return net
+
 
 ################################ GradAlign loss #######################################
 def get_uniform_delta(shape, eps, requires_grad=True):
@@ -292,6 +293,7 @@ def get_uniform_delta(shape, eps, requires_grad=True):
     delta.uniform_(-eps, eps)
     delta.requires_grad = requires_grad
     return delta
+
 
 def get_input_grad(model, X, y, eps, delta_init='none', backprop=False):
     if delta_init == 'none':
@@ -313,15 +315,16 @@ def get_input_grad(model, X, y, eps, delta_init='none', backprop=False):
         grad, delta = grad.detach(), delta.detach()
     return grad
 
-def grad_align_loss(model, X, y, args):
 
-    grad1 = get_input_grad(model, X, y,  args.train_eps, delta_init='none', backprop=False)
-    grad2 = get_input_grad(model, X, y,  args.train_eps, delta_init='random_uniform', backprop=True)
+def grad_align_loss(model, X, y, args):
+    grad1 = get_input_grad(model, X, y, args.train_eps, delta_init='none', backprop=False)
+    grad2 = get_input_grad(model, X, y, args.train_eps, delta_init='random_uniform', backprop=True)
     grad1, grad2 = grad1.reshape(len(grad1), -1), grad2.reshape(len(grad2), -1)
     cos = torch.nn.functional.cosine_similarity(grad1, grad2, 1)
     reg = args.gradalign_lambda * (1.0 - cos.mean())
 
     return reg
+
 
 ################################ TRADES loss #######################################
 def squared_l2_norm(x):
@@ -406,7 +409,7 @@ def trades_loss(model,
 ################################ AutoAttack #######################################
 def AutoAttack(model, args, dataset='CIFAR10', norm='Linf', epsilon=8):
     model.eval()
-    print ('evaluate AA:', dataset, norm, epsilon)
+    print('evaluate AA:', dataset, norm, epsilon)
     epsilon /= 255.
     if dataset == 'CIFAR10':
         __, __, test_loader = cifar10_dataloaders(batch_size=1000)
@@ -418,28 +421,29 @@ def AutoAttack(model, args, dataset='CIFAR10', norm='Linf', epsilon=8):
     l = [y for (x, y) in test_loader]
     y_test = torch.cat(l, 0)
 
-    # load attack    
+    # load attack
     from autoattack import AutoAttack
     adversary = AutoAttack(model, norm=norm, eps=epsilon, log_path=os.path.join(args.save_dir, 'log_file.txt'),
-        version='standard')
+                           version='standard')
 
     # run attack and save images
     with torch.no_grad():
         adv_complete = adversary.run_standard_evaluation(x_test, y_test, bs=1000)
 
+
 ################################ Guided_Attack #######################################
-def Guided_Attack(model,loss,image,target,eps=8/255,bounds=[0,1],steps=1,P_out=[],l2_reg=10,alt=1): 
+def Guided_Attack(model, loss, image, target, eps=8 / 255, bounds=[0, 1], steps=1, P_out=[], l2_reg=10, alt=1):
     tar = Variable(target.cuda())
     img = image.cuda()
-    eps = eps/steps 
+    eps = eps / steps
     for step in range(steps):
-        img = Variable(img,requires_grad=True)
-        zero_gradients(img) 
-        out  = model(img)
+        img = Variable(img, requires_grad=True)
+        zero_gradients(img)
+        out = model(img)
         R_out = nn.Softmax(dim=1)(out)
-        cost = loss(out,tar) + alt*l2_reg*(((P_out - R_out)**2.0).sum(1)).mean(0) 
+        cost = loss(out, tar) + alt * l2_reg * (((P_out - R_out) ** 2.0).sum(1)).mean(0)
         cost.backward()
         per = eps * torch.sign(img.grad.data)
-        adv = img.data + per.cuda() 
-        img = torch.clamp(adv,bounds[0],bounds[1])
+        adv = img.data + per.cuda()
+        img = torch.clamp(adv, bounds[0], bounds[1])
     return img

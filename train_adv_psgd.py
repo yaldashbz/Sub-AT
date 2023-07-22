@@ -52,27 +52,28 @@ parser.add_argument('--log-name', dest='log_name',
                     help='The log file name',
                     default='log', type=str)
 parser.add_argument('--wandb', action='store_true', help='use wandb for online visualization')
-parser.add_argument('--randomseed', 
+parser.add_argument('--wandb-name', default='', type=str)
+parser.add_argument('--randomseed',
                     help='Randomseed for initialization and training',
                     type=int, default=0)
 
 ########################## Sub-AT setting ##########################
 parser.add_argument('--n_components', default=80, type=int, metavar='N',
-                    help='n_components for PCA') 
+                    help='n_components for PCA')
 parser.add_argument('--params_start', default=0, type=int, metavar='N',
-                    help='which idx starts for sampling') 
+                    help='which idx starts for sampling')
 parser.add_argument('--params_end', default=81, type=int, metavar='N',
-                    help='which idx ends for sampling') 
+                    help='which idx ends for sampling')
 parser.add_argument('--skip', action='store_true', help='skip for DLDR sampling')
 parser.add_argument('--lr', default=1, type=float, metavar='N',
-                    help='lr for Sub-AT') 
+                    help='lr for Sub-AT')
 
 ########################## attack setting ##########################
 adversary_names = ['Fast-AT', 'PGD', 'gradalign', 'GAT', 'trades']
 parser.add_argument('--attack', metavar='attack', default='Fast-AT',
                     choices=adversary_names,
                     help='adversary for genernating adversarial examples: ' + ' | '.join(adversary_names) +
-                    ' (default: Fast-AT)')
+                         ' (default: Fast-AT)')
 
 # Fast-AT / PGD
 parser.add_argument('--norm', default='linf', type=str, help='linf or l2')
@@ -90,27 +91,30 @@ parser.add_argument('--gradalign_lambda', default=0.2, type=float, help='lambda 
 # guideattack
 parser.add_argument('--GAT_lambda', default=10.0, type=float, help='lambda for GAT')
 # evaluate
-parser.add_argument('--pgd50',  action='store_true', help='evaluate the model with pgd50 (default: False)')
+parser.add_argument('--pgd50', action='store_true', help='evaluate the model with pgd50 (default: False)')
 parser.add_argument('--autoattack', '--aa', action='store_true', help='evaluate the model with AA (default: False)')
 
 args = parser.parse_args()
 
 # Check the save_dir exists or not
-print ('save dir:', args.save_dir)
+print('save dir:', args.save_dir)
 if not os.path.exists(args.save_dir):
     os.makedirs(args.save_dir)
 
 # Check the log_dir exists or not
-print ('log dir:', args.log_dir)
+print('log dir:', args.log_dir)
 if not os.path.exists(args.log_dir):
     os.makedirs(args.log_dir)
 
 sys.stdout = Logger(os.path.join(args.log_dir, args.log_name))
 if args.wandb:
-    print ('tracking with wandb!')
+    print('tracking with wandb!')
     wandb.init(project="sub-at", entity="yaldashbz")
-    date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()) 
-    wandb.run.name = args.EXP + date
+    date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    if args.wandb_name != '':
+        wandb.run.name = args.wandb_name + '-' + args.EXP + date
+    else:
+        wandb.run.name = args.EXP + date
 
 set_seed(args.randomseed)
 print_args(args)
@@ -132,70 +136,73 @@ test_natural_acc = []
 test_natural_loss = []
 arr_time = []
 
+
 def get_model_param_vec(model):
     """
     Return model parameters as a vector
     """
     vec = []
-    for name,param in model.named_parameters():
+    for name, param in model.named_parameters():
         vec.append(param.detach().cpu().numpy().reshape(-1))
     return np.concatenate(vec, 0)
+
 
 def get_model_grad_vec(model):
     # Return the model grad as a vector
 
     vec = []
-    for name,param in model.named_parameters():
+    for name, param in model.named_parameters():
         vec.append(param.grad.detach().reshape(-1))
     return torch.cat(vec, 0)
+
 
 def update_grad(model, grad_vec):
     """
     Update model grad
     """
     idx = 0
-    for name,param in model.named_parameters():
+    for name, param in model.named_parameters():
         arr_shape = param.grad.shape
         size = arr_shape.numel()
-        param.grad.data = grad_vec[idx:idx+size].reshape(arr_shape).clone()
+        param.grad.data = grad_vec[idx:idx + size].reshape(arr_shape).clone()
         idx += size
+
 
 def main():
     global args, best_robust, P, arr_time, train_eps
-    
+
     # Define model
     model = torch.nn.DataParallel(get_model(args))
     model.cuda()
 
     cudnn.benchmark = True
 
-        
     ################################ DLDR #######################################
     # Load sampled model parameters
-    print ('params: from', args.params_start, 'to', args.params_end)
+    print('params: from', args.params_start, 'to', args.params_end)
     W = []
     for i in range(args.params_start, args.params_end):
         if args.skip and i % 2 != 0: continue
-        model.load_state_dict(torch.load(os.path.join(args.save_dir,  str(i) +  '.pt')))
+        model.load_state_dict(torch.load(os.path.join(args.save_dir, str(i) + '.pt')))
         W.append(get_model_param_vec(model))
     W = np.array(W)
-    print ('W:', W.shape)
+    print('W:', W.shape)
 
     # Obtain base variables through PCA
     pca = PCA(n_components=args.n_components)
     pca.fit_transform(W)
     P = np.array(pca.components_)
-    print ('ratio:', pca.explained_variance_ratio_)
-    print ('P:', P.shape)
+    print('ratio:', pca.explained_variance_ratio_)
+    print('P:', P.shape)
 
     P = torch.from_numpy(P).cuda()
 
     # Resume from params_start
-    model.load_state_dict(torch.load(os.path.join(args.save_dir,  str(args.params_start) +  '.pt')))
+    model.load_state_dict(torch.load(os.path.join(args.save_dir, str(args.params_start) + '.pt')))
 
     # Prepare Dataloader
     train_loader, val_loader, test_loader = get_datasets(args)
-    
+
     # Define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
@@ -209,7 +216,7 @@ def main():
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch']
-            print ('from ', args.start_epoch)
+            print('from ', args.start_epoch)
             best_robust = checkpoint['best_robust']
             optimizer = checkpoint['optimizer']
             model.load_state_dict(checkpoint['state_dict'])
@@ -219,7 +226,7 @@ def main():
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     if args.evaluate:
-        validate(test_loader, model, criterion)    
+        validate(test_loader, model, criterion)
         if args.pgd50:
             epoch_adversarial_PGD50(test_loader, model)
         if args.autoattack:
@@ -230,15 +237,15 @@ def main():
 
     ################################ Sub-AT #######################################
     is_best = 0
-    print ('Start training: ', args.start_epoch, '->', args.epochs)
+    print('Start training: ', args.start_epoch, '->', args.epochs)
 
-    print ('adversary:', args.attack)
+    print('adversary:', args.attack)
     if args.attack == 'gradalign':
         arr_lambda = [0, 0.03, 0.04, 0.05, 0.06, 0.08, 0.11, 0.15, 0.20, 0.27, 0.36, 0.47, 0.63, 0.84, 1.12, 1.50, 2.00]
         args.gradalign_lambda = arr_lambda[int(args.train_eps)]
-        print ('gradalign lambda:', args.gradalign_lambda)
+        print('gradalign lambda:', args.gradalign_lambda)
     if args.attack == 'GAT':
-        print ('GAT_lambda:', args.GAT_lambda)
+        print('GAT_lambda:', args.GAT_lambda)
 
     nat_last5 = []
     rob_last5 = []
@@ -254,31 +261,32 @@ def main():
         natural_acc = validate(test_loader, model, criterion)
         # validate(train_loader, model, criterion)
 
-        torch.save(model.state_dict(), os.path.join(args.save_dir, 'train' + str(train_eps) + 'psgd_' + str(epoch) + '.pt'))
+        torch.save(model.state_dict(),
+                   os.path.join(args.save_dir, 'train' + str(train_eps) + 'psgd_' + str(epoch) + '.pt'))
 
         # evaluate the adversarial robustness on validation set
         robust_acc, adv_loss = epoch_adversarial(val_loader, model, args)
         val_robust_acc.append(robust_acc)
         val_robust_loss.append(adv_loss)
-        print ('adv acc on validation set', robust_acc)
+        print('adv acc on validation set', robust_acc)
 
         # remember best prec@1 and save checkpoint
         is_best = robust_acc > best_robust
         best_robust = max(robust_acc, best_robust)
-    
+
         if args.wandb:
             wandb.log({"test natural acc": natural_acc})
             wandb.log({"test robust acc": robust_acc})
 
         if epoch + 5 >= args.epochs:
-            nat_last5.append(natural_acc)        
+            nat_last5.append(natural_acc)
             robust_acc, adv_loss = epoch_adversarial(test_loader, model, args)
-            print ('adv acc on test set', robust_acc)
+            print('adv acc on test set', robust_acc)
             rob_last5.append(robust_acc)
 
         if is_best:
             torch.save(model.state_dict(), os.path.join(args.save_dir, 'train_eps' + str(train_eps) + 'psgd_best.pt'))
-        
+
         save_checkpoint({
             'state_dict': model.state_dict(),
             'best_robust': best_robust,
@@ -286,29 +294,29 @@ def main():
             'optimizer': optimizer
         }, filename=os.path.join(args.save_dir, 'psgd_model.th'))
 
-    print ('train_robust_acc: ', train_robust_acc)
-    print ('train_robust_loss: ', train_robust_loss)
-    print ('val_robust_acc: ', val_robust_acc)
-    print ('val_robust_loss: ', val_robust_loss)
-    print ('test_natural_acc: ', test_natural_acc)
-    print ('test_natural_loss: ', test_natural_loss)
-    print ('total training time: ', np.sum(arr_time))    
-    print ('last 5 adv acc on test dataset:', np.mean(rob_last5))
-    print ('last 5 nat acc on test dataset:', np.mean(nat_last5))
+    print('train_robust_acc: ', train_robust_acc)
+    print('train_robust_loss: ', train_robust_loss)
+    print('val_robust_acc: ', val_robust_acc)
+    print('val_robust_loss: ', val_robust_loss)
+    print('test_natural_acc: ', test_natural_acc)
+    print('test_natural_loss: ', test_natural_loss)
+    print('total training time: ', np.sum(arr_time))
+    print('last 5 adv acc on test dataset:', np.mean(rob_last5))
+    print('last 5 nat acc on test dataset:', np.mean(nat_last5))
     del P
     torch.cuda.empty_cache()
 
-    print ('final:')
+    print('final:')
     torch.save(model.state_dict(), os.path.join(args.save_dir, 'train_eps' + str(train_eps) + 'psgd_final.pt'))
     if args.pgd50:
         epoch_adversarial_PGD50(test_loader, model)
     if args.autoattack:
         AutoAttack(model, args, dataset=args.datasets)
 
-    print ('best:')
+    print('best:')
     model.load_state_dict(torch.load(os.path.join(args.save_dir, 'train_eps' + str(train_eps) + 'psgd_best.pt')))
     robust_acc, adv_loss = epoch_adversarial(test_loader, model, args)
-    print ('best adv acc on test dataset:', robust_acc)
+    print('best adv acc on test dataset:', robust_acc)
 
     if args.pgd50:
         epoch_adversarial_PGD50(test_loader, model)
@@ -321,7 +329,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     # Run one train epoch
 
     global P, train_robust_acc, train_robust_loss, args, arr_time
-    
+
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -336,9 +344,9 @@ def train(train_loader, model, criterion, optimizer, epoch):
         adversary = L2PGDAttack(
             model, loss_fn=criterion, eps=args.train_eps, nb_iter=args.train_step, eps_iter=args.train_gamma,
             rand_init=args.train_randinit, clip_min=0.0, clip_max=1.0, targeted=False
-        )  
+        )
 
-    # Switch to train mode
+        # Switch to train mode
     model.train()
 
     end = time.time()
@@ -355,50 +363,52 @@ def train(train_loader, model, criterion, optimizer, epoch):
         if args.attack == 'trades':
             # calculate robust loss
             output, loss = trades_loss(model=model,
-                            x_natural=input_var,
-                            y=target_var,
-                            optimizer=optimizer,
-                            step_size=args.train_gamma,
-                            epsilon=args.train_eps,
-                            perturb_steps=args.train_step,
-                            beta=6.0)
+                                       x_natural=input_var,
+                                       y=target_var,
+                                       optimizer=optimizer,
+                                       step_size=args.train_gamma,
+                                       epsilon=args.train_eps,
+                                       perturb_steps=args.train_step,
+                                       beta=6.0)
 
         elif args.attack == 'GAT':
             eps = args.train_eps
-            out  = model(input_var)
+            out = model(input_var)
             P_out = nn.Softmax(dim=1)(out)
-        
+
             # input_adv = input_var + ((4./255.0)*torch.sign(torch.tensor([0.5]).cuda() - torch.rand_like(input_var).cuda()).cuda())
-            input_adv = input_var + (eps/2*torch.sign(torch.tensor([0.5]).cuda() - torch.rand_like(input_var).cuda()).cuda())
-            input_adv = torch.clamp(input_adv,0.0,1.0)       
+            input_adv = input_var + (
+                        eps / 2 * torch.sign(torch.tensor([0.5]).cuda() - torch.rand_like(input_var).cuda()).cuda())
+            input_adv = torch.clamp(input_adv, 0.0, 1.0)
 
             model.eval()
-            input_adv = Guided_Attack(model,nn.CrossEntropyLoss(),input_adv,target,eps=eps,steps=1,P_out=P_out,l2_reg=10,alt=(i%2))
+            input_adv = Guided_Attack(model, nn.CrossEntropyLoss(), input_adv, target, eps=eps, steps=1, P_out=P_out,
+                                      l2_reg=10, alt=(i % 2))
 
             delta = input_adv - input_var
-            delta = torch.clamp(delta,-eps,eps)
-            input_adv = input_var+delta
-            input_adv = torch.clamp(input_adv,0.0,1.0)
+            delta = torch.clamp(delta, -eps, eps)
+            input_adv = input_var + delta
+            input_adv = torch.clamp(input_adv, 0.0, 1.0)
 
             model.train()
             adv_out = model(input_adv)
-            out  = model(input_var)
-            
+            out = model(input_var)
+
             output = adv_out
-            
+
             Q_out = nn.Softmax(dim=1)(adv_out)
             P_out = nn.Softmax(dim=1)(out)
-        
+
             '''LOSS COMPUTATION'''
-            
+
             closs = criterion(out, target_var)
-            
-            reg_loss =  ((P_out - Q_out)**2.0).sum(1).mean(0)
-            
-            loss = 1.0*closs + 10.0*reg_loss
+
+            reg_loss = ((P_out - Q_out) ** 2.0).sum(1).mean(0)
+
+            loss = 1.0 * closs + 10.0 * reg_loss
 
         else:
-            #adv samples
+            # adv samples
             with ctx_noparamgrad(model):
                 input_adv = adversary.perturb(input_var, target_var)
 
@@ -425,16 +435,16 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # Measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-        
-        if i % args.print_freq == 0 or i == len(train_loader)-1:
+
+        if i % args.print_freq == 0 or i == len(train_loader) - 1:
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                      epoch, i, len(train_loader), batch_time=batch_time,
-                      data_time=data_time, loss=losses, top1=top1))
-        
+                epoch, i, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=losses, top1=top1))
+
     train_robust_loss.append(losses.avg)
     train_robust_acc.append(top1.avg)
     if args.wandb:
@@ -446,7 +456,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
 def P_SGD(model, optimizer, grad):
     # Project the gradient onto the subspace and do SGD step
 
-    gk = torch.mm(P, grad.reshape(-1,1))
+    gk = torch.mm(P, grad.reshape(-1, 1))
 
     grad_proj = torch.mm(P.transpose(0, 1), gk)
 
@@ -454,10 +464,11 @@ def P_SGD(model, optimizer, grad):
     update_grad(model, grad_proj)
     optimizer.step()
 
+
 def validate(val_loader, model, criterion):
     # Run evaluation
 
-    global test_natural_acc, test_natural_loss  
+    global test_natural_acc, test_natural_loss
 
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -494,8 +505,8 @@ def validate(val_loader, model, criterion):
                       'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                          i, len(val_loader), batch_time=batch_time, loss=losses,
-                          top1=top1))
+                    i, len(val_loader), batch_time=batch_time, loss=losses,
+                    top1=top1))
 
     print(' * Prec@1 {top1.avg:.3f}'
           .format(top1=top1))
@@ -506,10 +517,12 @@ def validate(val_loader, model, criterion):
 
     return top1.avg
 
+
 def save_checkpoint(state, filename='checkpoint.pth.tar'):
     # Save the training model
 
     torch.save(state, filename)
+
 
 class AverageMeter(object):
     # Computes and stores the average and current value
@@ -545,6 +558,7 @@ def accuracy(output, target, topk=(1,)):
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
+
 
 if __name__ == '__main__':
     main()
